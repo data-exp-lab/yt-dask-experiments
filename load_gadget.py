@@ -1,5 +1,7 @@
 # Note that this requires yt 4!
 import yt
+import contextlib
+from collections import defaultdict
 
 ds = yt.load_sample("snapshot_033")
 print(ds.index)
@@ -52,3 +54,69 @@ for i, chunk in enumerate(reg.chunks([], "io")):
 
 # Let's try now what happens if we look at current chunk *after* we access a data field.
 print_chunk_info(reg, 0)
+
+# So what we see is that the result of _identify_base_chunk has been popped
+# into the region as the _current_chunk.
+#
+# A lot of this happens in the `_chunked_read` function, which is a context
+# manager that tracks objects and fields.
+#
+# It's a little tricky to instrument this because it's a context manager.  But,
+# if we instrument it with just a print statement, we can see when and how it's
+# called.
+#
+#   @contextmanager
+#   def _chunked_read(self, chunk):
+#       # There are several items that need to be swapped out
+#       # field_data, size, shape
+#       obj_field_data = []
+#       if hasattr(chunk, "objs"):
+#           for obj in chunk.objs:
+#               obj_field_data.append(obj.field_data)
+#               obj.field_data = YTFieldData()
+#       old_field_data, self.field_data = self.field_data, YTFieldData()
+#       old_chunk, self._current_chunk = self._current_chunk, chunk
+#       old_locked, self._locked = self._locked, False
+#       yield
+#       self.field_data = old_field_data
+#       self._current_chunk = old_chunk
+#       self._locked = old_locked
+#       if hasattr(chunk, "objs"):
+#           for obj in chunk.objs:
+#               obj.field_data = obj_field_data.pop(0)
+
+levels = {'level': 0} # make it mutable
+
+def trace_chunked_read(func):
+    space ="  "
+    @contextlib.contextmanager
+    def _func(self, *args, **kwargs):
+        levels['level'] += 1
+        print(f"{space * levels['level']}Entering chunked_read at level  {levels['level']}")
+        yield func(self, *args, **kwargs)
+        print(f"{space * levels['level']}Exiting chunked_read from level {levels['level']}")
+        levels['level'] -= 1
+    return _func
+
+reg = ds.r[0.1:0.2,0.1:0.2,0.1:0.2]
+
+reg._chunked_read = trace_chunked_read(reg._chunked_read)
+reg["density"]
+for chunk_index, chunk in enumerate(reg.chunks([], "io")):
+    field = reg["density"]
+    print(f"{chunk_index=} with {field.size=}")
+
+# We do this to demonstrate something that happens much more frequently in the context of 
+
+print("\n\nNow, we run it again, with a layered chunking.\n")
+
+levels = defaultdict(lambda: 0)
+
+for chunk in reg.chunks([], "all"):
+    for subchunk in reg.chunks([], "io"):
+        print(f"{chunk_index=} with {field.size=}")
+
+# This doesn't prove that *much* except that we have a layered chunking system.
+# What we want to take a look at is how the chunking process works.
+
+
