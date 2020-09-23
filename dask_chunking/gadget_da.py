@@ -5,6 +5,20 @@ import numpy as np
 import dask
 import yt
 
+class MockDs(object):
+    def __init__(self,ds):
+        self.domain_left_edge = ds.domain_left_edge
+        self.domain_right_edge = ds.domain_right_edge
+        self.periodicity = ds.periodicity
+        
+class MockSphere(object):
+    # a stripped down sphere that records only the attributes required to initialize the 
+    # sphere Selector Object
+    def __init__(self,sp):
+        self.center = sp.center 
+        self.radius = sp.radius
+        self.ds = MockDs(sp.ds)
+                
 class MockSelector:
     is_all_data = True
 
@@ -17,7 +31,7 @@ class MockChunk:
         self.objs = [MockChunkObject(data_file)]
         
 class delayed_gadget(object):    
-    def __init__(self,ds, ptf = None, subchunk_size = 100000):
+    def __init__(self,ds, ptf = None, mock_selector = None, subchunk_size = 100000):
         
         # references that we need to read in gadget data 
         self.var_mass = ds.index.io.var_mass
@@ -27,15 +41,17 @@ class delayed_gadget(object):
         self.chunks = [MockChunk(data_file) for data_file in ds.index.data_files]
         self.data_files = self.return_data_files()
         self.subchunk_size = subchunk_size
+        self.mock_selector = mock_selector
+        self.ptf = ptf 
+        
+        # containers for delayed objects 
+        self.delayed_chunks = [] # full chunks 
+        self.masks = [] # only masks 
+        self.masked_chunks = [] # masked chunks 
         
         # initialize the delayed on full dataset 
-        if ptf is None: 
-            self.delayed_chunks = []
-            self.ptf = None 
-        else:
-            self.stage_chunks(ptf) 
-                
-        self.masks=[]
+        if ptf is not None:
+            self.stage_chunks(ptf)
         
     def return_data_files(self):    
         data_files = set([])
@@ -55,13 +71,22 @@ class delayed_gadget(object):
             df_dict['_element_names']=self._element_names                        
             self.delayed_chunks.append(delayed_chunk_read(self.ptf,df_dict,self.subchunk_size))
             
-    def set_chunk_masks(self,selector):
-        # ideally we'd assemlbe the masks based on the delayed chunk and a selector
-        # and then we could apply any filtering on top of the delayed read, 
-        # but this fails because dask cant serialize the selector object 
+        self.set_chunk_masks() 
+        self.apply_masks()
+            
+    def set_chunk_masks(self,mock_selector = None):
+        # sets the delayed masks by chunk 
+        if mock_selector is not None:
+            self.mock_selector = mock_selector 
+            
         self.masks=[]
         for chunk in self.delayed_chunks:
-            self.masks.append(get_chunk_masks(self.ptf,chunk,selector))
+            self.masks.append(get_chunk_masks(self.ptf,chunk,self.mock_selector))
+            
+    def apply_masks(self):
+        self.masked_chunks = [] 
+        for chunk,mask in zip(self.delayed_chunks,self.masks):
+            self.masked_chunks.append(delayed_masked_chunk(chunk,mask))
     
 # pickle-serialization safe object to give to dask delayed
 @dask.delayed
@@ -158,16 +183,17 @@ class chunk_reader(object):
             col = int(field.rsplit("_", 1)[-1])
             data = g["ChemistryAbundances"][si:ei, col]         
         else:
-            data = g[field][si:ei]
-                    
+            data = g[field][si:ei]                    
         return data 
 
-# selector needs to be serializable to delay this!!!!!! so this fails cause of the cython
 @dask.delayed 
-def get_chunk_masks(ptf,chunk,selector):
-
-    if selector is None: 
-        selector = MockSelector() 
+def get_chunk_masks(ptf,chunk,mock_selection_obj):
+    # mock_selection_obj here is a stripped down selection object containing only 
+    # the pickable attributes required for initialization of the selection_routines.
+    if mock_selection_obj is None: 
+        selector = MockSelector()
+    else:
+        selector = yt.geometry.selection_routines.SphereSelector(mock_selection_obj)
 
     chunk_masks = {}
     for ptype, field_list in sorted(ptf.items()):
@@ -190,3 +216,19 @@ def get_chunk_masks(ptf,chunk,selector):
         chunk_masks[ptype] = (mask,mask_sum)
 
     return chunk_masks
+    
+@dask.delayed 
+def delayed_masked_chunk(chunk,mask):    
+    # chunk [coords, data , total_particles, hsmls]    
+    data={}
+    coords = {}
+    for ptype_fld, chunk_data in chunk[1].items(): 
+        ptype=ptype_fld[0]
+        this_mask = mask[ptype][0]
+        data[ptype_fld] = chunk_data[this_mask]
+    
+    for ptype, coordvals in chunk[0].items():
+        this_mask = mask[ptype][0]
+        coords[ptype] = coordvals[this_mask] 
+        
+    return coords, data 
