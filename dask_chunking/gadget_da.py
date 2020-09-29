@@ -193,7 +193,10 @@ def get_chunk_masks(ptf,chunk,mock_selection_obj):
     if mock_selection_obj is None: 
         selector = MockSelector()
     else:
-        selector = yt.geometry.selection_routines.SphereSelector(mock_selection_obj)
+        if isinstance(mock_selection_obj,MockSphere):
+            selector = yt.geometry.selection_routines.SphereSelector(mock_selection_obj)
+        else:
+            selector = mock_selection_obj# no longer a mock! 
 
     chunk_masks = {}
     for ptype, field_list in sorted(ptf.items()):
